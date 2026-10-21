@@ -258,43 +258,51 @@ func TestDatabaseService_StateUpdateTimeIsSet(t *testing.T) {
 func TestDatabaseService_DeleteRemovesSessionEvents(t *testing.T) {
 	ctx := t.Context()
 	s := emptyService(t)
-	deleted, err := s.Create(ctx, &session.CreateRequest{AppName: "app", UserID: "user", SessionID: "deleted"})
-	if err != nil {
-		t.Fatalf("Create(deleted): %v", err)
+	deleted := session.DeleteRequest{AppName: "app", UserID: "user", SessionID: "s1"}
+	// Sessions that share part of the deleted session's (app, user, session)
+	// key, so their events must survive the delete.
+	kept := []session.DeleteRequest{
+		{AppName: "app", UserID: "user", SessionID: "s2"},
+		{AppName: "app", UserID: "other-user", SessionID: "s1"},
+		{AppName: "other-app", UserID: "user", SessionID: "s1"},
 	}
-	kept, err := s.Create(ctx, &session.CreateRequest{AppName: "app", UserID: "user", SessionID: "kept"})
-	if err != nil {
-		t.Fatalf("Create(kept): %v", err)
-	}
-	for _, sess := range []session.Session{deleted.Session, kept.Session} {
+	for _, key := range append([]session.DeleteRequest{deleted}, kept...) {
+		created, err := s.Create(ctx, &session.CreateRequest{AppName: key.AppName, UserID: key.UserID, SessionID: key.SessionID})
+		if err != nil {
+			t.Fatalf("Create(%+v): %v", key, err)
+		}
 		event := &session.Event{
-			ID:          "e-" + sess.ID(),
+			ID:          "e-" + key.AppName + "-" + key.UserID + "-" + key.SessionID,
 			Author:      "tool",
 			Timestamp:   time.Now(),
 			LLMResponse: model.LLMResponse{Content: genai.NewContentFromText("tool output", genai.RoleUser)},
 		}
-		if err := s.AppendEvent(ctx, sess, event); err != nil {
-			t.Fatalf("AppendEvent(%s): %v", sess.ID(), err)
+		if err := s.AppendEvent(ctx, created.Session, event); err != nil {
+			t.Fatalf("AppendEvent(%+v): %v", key, err)
 		}
 	}
 
-	if err := s.Delete(ctx, &session.DeleteRequest{AppName: "app", UserID: "user", SessionID: "deleted"}); err != nil {
+	if err := s.Delete(ctx, &deleted); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
-	var left int64
-	if err := s.db.Model(&storageEvent{}).Where("session_id = ?", "deleted").Count(&left).Error; err != nil {
-		t.Fatalf("count events of deleted session: %v", err)
+	countEvents := func(key session.DeleteRequest) int64 {
+		t.Helper()
+		var n int64
+		if err := s.db.Model(&storageEvent{}).
+			Where("app_name = ? AND user_id = ? AND session_id = ?", key.AppName, key.UserID, key.SessionID).
+			Count(&n).Error; err != nil {
+			t.Fatalf("count events of %+v: %v", key, err)
+		}
+		return n
 	}
-	if left != 0 {
-		t.Errorf("events left for deleted session = %d, want 0", left)
+	if got := countEvents(deleted); got != 0 {
+		t.Errorf("events left for deleted session %+v = %d, want 0", deleted, got)
 	}
-	var other int64
-	if err := s.db.Model(&storageEvent{}).Where("session_id = ?", "kept").Count(&other).Error; err != nil {
-		t.Fatalf("count events of kept session: %v", err)
-	}
-	if other != 1 {
-		t.Errorf("events left for kept session = %d, want 1", other)
+	for _, key := range kept {
+		if got := countEvents(key); got != 1 {
+			t.Errorf("events left for kept session %+v = %d, want 1", key, got)
+		}
 	}
 }
 
